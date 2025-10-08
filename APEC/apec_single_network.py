@@ -15,23 +15,23 @@ from matplotlib import rcParams
 import scienceplots
 import time
 
-# juste après vos rcParams, ou tout en haut du script :
+# Ensure minus signs render properly with the chosen font backend
 plt.rcParams['axes.unicode_minus'] = False
 
 
 t0 = time.time()
-# ── 1) Chargement des données ─────────────────────────────────────────────────
+# ── 1) Load dataset from NPZ ──────────────────────────────────────────────────
 data_path    = Path("/tmpdir/ferec/apec_log1e5_7.0-9.0keV.npz")
 data         = np.load(data_path)
 spectres     = data["spectra"]          # intensités brutes
 theta        = data["params"][:, :2]    # kT et abondance seulement
 energy_array = data["energy"]
 
-# ── 2) Log-transform des spectres ────────────────────────────────────────────
+# ── 2) Optional log-transform of spectra (disabled by default) ───────────────
 spectres_lp = spectres
 # spectres_lp = np.log1p(spectres)
 
-# ── 3) Scalers (fit sur tout le jeu) ──────────────────────────────────────────
+# ── 3) Scaling (fit on the full set; theta left unscaled here) ───────────────
 #scaler_theta  = StandardScaler().fit(theta)
 scaler_spec   = StandardScaler().fit(spectres_lp)
 
@@ -39,7 +39,7 @@ theta_scaled    = theta
 #scaler_theta.transform(theta)
 spectres_scaled = scaler_spec.transform(spectres_lp)
 
-# ── 4) Split train/test ───────────────────────────────────────────────────────
+# ── 4) Train/test split ──────────────────────────────────────────────────────
 X_train, X_test, y_train, y_test = train_test_split(
     theta_scaled,
     spectres_scaled,
@@ -47,8 +47,14 @@ X_train, X_test, y_train, y_test = train_test_split(
     random_state=42
 )
 
-# ── 5) Définition du modèle ───────────────────────────────────────────────────
+# ── 5) Model definition (continuum + emission heads, then summed) ────────────
 def build_surrogate_model(input_dim, output_dim):
+    """
+    Small MLP surrogate for APEC spectra:
+    - three shared dense layers with GELU
+    - two heads: 'continuum' (linear) and 'emission' (softplus)
+    - final spectrum = continuum + emission
+    """
     inputs  = Input(shape=(input_dim,), name="input_layer")
     n_units = 128
 
@@ -71,23 +77,41 @@ input_dim  = X_train.shape[1]
 output_dim = y_train.shape[1]
 model      = build_surrogate_model(input_dim, output_dim)
 
-# ── 6) Compilation avec loss custom ────────────────────────────────────────────
+# ── 6) Loss functions ────────────────────────────────────────────────────────
 def improved_spectral_loss(y_true, y_pred):
+    """
+    Composite loss on standardized spectra:
+      - MSE on values
+      - MSE on first derivative (slope) along energy bins
+      - 2× MSE on second derivative (curvature) along energy bins
+    This encourages both baseline accuracy and local shape fidelity.
+    """
     mse = tf.reduce_mean(tf.square(y_true - y_pred))
+
+    # First derivative (finite differences)
     dy_true = y_true[:,1:] - y_true[:,:-1]
     dy_pred = y_pred[:,1:] - y_pred[:,:-1]
     grad = tf.reduce_mean(tf.square(dy_true - dy_pred))
+
+    # Second derivative (curvature)
     ddy_true = dy_true[:,1:] - dy_true[:,:-1]
     ddy_pred = dy_pred[:,1:] - dy_pred[:,:-1]
     curv = tf.reduce_mean(tf.square(ddy_true - ddy_pred))
+    
     return mse + grad + 2.0 * curv
 
 
-# just avant de compiler le modèle, récupérez les paramètres du scaler
+# Retrieve scaler parameters for masked loss (kept in standardized space)
 mean_spec  = tf.constant(scaler_spec.mean_,  dtype=tf.float32)  # shape (n_bins,)
 scale_spec = tf.constant(scaler_spec.scale_, dtype=tf.float32)  # shape (n_bins,)
 
 def masked_spectral_loss(y_true, y_pred, eps=1e-8):
+    """
+    Masked variant of the composite loss:
+      1) Map standardized y_true back to original scale using scaler stats.
+      2) Build a per-sample mask keeping only bins with signal >= max(y)/5e5.
+      3) Apply MSE + grad + curvature only on significant bins.
+    """
     # 1) reconstruire y_true dans son espace original : y_true_lin = y_true*scale + mean
     y_true_lin = y_true * scale_spec + mean_spec
 
@@ -131,7 +155,7 @@ model.compile(
 
 model.summary()
 
-# ── 7) Callbacks & entraînement ─────────────────────────────────────────────
+# ── 7) Callbacks & training ──────────────────────────────────────────────────
 early_stopping = EarlyStopping(
     monitor="val_loss", patience=10,
     restore_best_weights=True, verbose=1
@@ -151,7 +175,8 @@ history = model.fit(
 )
 
 t1 = time.time()
-print(f"⏱️ Compilation du modèle terminée en {t1-t0:.3f} secondes")
+# Note: message says "compilation" but this includes training wall time as well.
+print(f"⏱️ Model compilation completed in {t1-t0:.3f} seconds")
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -159,10 +184,14 @@ from matplotlib import rcParams
 import scienceplots
 
 def plot_loss(history):
-    # Appliquer le style scientifique sans LaTeX
+    """
+    Plot train/validation loss on a log scale and save to 'apec_loss.png'.
+    Uses a compact, IEEE-like aesthetic via scienceplots.
+    """
+    # Apply scientific style without LaTeX dependency
     plt.style.use(['science', 'no-latex'])
     
-    # Paramètres RC pour un rendu IEEE
+    # Compact figure preset
     rcParams['figure.figsize'] = (3.5, 2.5)  # Taille du plot en pouces
     rcParams['figure.dpi'] = 300             # Haute résolution
     rcParams['font.size'] = 8                # Taille des polices
@@ -174,7 +203,7 @@ def plot_loss(history):
     rcParams['lines.linewidth'] = 1.0        # Épaisseur des courbes
     rcParams['grid.linewidth'] = 0.5         # Épaisseur des lignes de la grille
     
-    # Création du graphique
+    # Loss curves
     plt.figure()
     plt.plot(history.history['loss'], label='Training Loss')
     plt.plot(history.history['val_loss'], label='Validation Loss')
@@ -189,22 +218,26 @@ def plot_loss(history):
 plot_loss(history)
 
 def plot_sample_styled(idx):
-    # 1) Récupération des données scalées et prédiction
+    """
+    Compare one reconstructed spectrum against ground truth and display
+    bin-wise relative error (%). Saves 'spectra_apec.png'.
+    """
+    # (1) Grab scaled inputs/targets and run prediction
     th_scaled   = X_test[idx:idx+1]
     true_scaled = y_test[idx]
     pred_scaled = model.predict(th_scaled)[0]
 
-    # 2) Inversion du scaler
+    # (2) Invert standardization to linear space for interpretability
     true_lin = scaler_spec.inverse_transform(true_scaled.reshape(1, -1))[0]
     pred_lin = scaler_spec.inverse_transform(pred_scaled.reshape(1, -1))[0]
 
-    # 3) Calcul de l'erreur
+    # (3) Relative error per bin and global relative error (L2)
     eps      = 1e-8
     err_bin  = (true_lin - pred_lin) / (np.abs(true_lin) + eps) * 100
     err_glob = 100 * np.linalg.norm(true_lin - pred_lin) / (np.linalg.norm(true_lin) + eps)
     print(f"Sample {idx} | Relative overall error: {err_glob:.3f}%\n")
 
-    # 4) Style IEEE
+    # (4) Compact, paper-like plotting preset
     plt.style.use(['science', 'no-latex'])
     rcParams['figure.figsize']    = (5, 4)
     rcParams['figure.dpi']        = 300
@@ -217,21 +250,21 @@ def plot_sample_styled(idx):
     rcParams['lines.linewidth']   = 1.0
     rcParams['grid.linewidth']    = 0.5
 
-    # 5) Création des subplots (2/3 pour le spectre, 1/3 pour l'erreur)
+    # (5) Two stacked subplots: spectra (log-y) + per-bin relative error
     fig, (ax1, ax2) = plt.subplots(
         2, 1,
         sharex=True,
         gridspec_kw={'height_ratios': [2, 1]}
     )
 
-    # ─── Spectres (semilogx) ────────────────────────────────────────────────
+    # Spectra comparison
     ax1.semilogy(energy_array, pred_lin, label='Reconstructed Spectrum')
     ax1.semilogy(energy_array, true_lin, linestyle='--', label='Original Spectrum')
     ax1.set_ylabel(r"Flux $(\mathrm{erg\,cm^{-2}\,s^{-1}})$")
     ax1.legend()
 
 
-    # ─── Erreur bin par bin (semilogx) ────────────────────────────────────
+    # Relative error per energy bin
     ax2.plot(energy_array, err_bin, label='Relative Error (%)')
     ax2.fill_between(energy_array, err_bin, alpha=0.3)
     ax2.axhline(0, color='gray', linestyle='--', linewidth=0.5)
@@ -243,19 +276,19 @@ def plot_sample_styled(idx):
     plt.show()
 
 
-# Exemple d'appel
+# Example call (choose an index inside [0, len(X_test)-1])
 plot_sample_styled(77)
 
 
 
 def plot_error_by_param_styled():
     """
-    Affiche en deux subplots (IEEE style) :
-      - à gauche : erreur globale vs kT
-      - à droite : erreur globale vs abondance
-    et indique l'indice du spectre avec l'erreur maximale.
+    Two subplots (shared y-axis):
+      - left: global relative error (%) vs. kT (keV)
+      - right: global relative error (%) vs. abundance
+    Also prints the index of the test sample with the largest error.
     """
-    # 1) Calcul des erreurs globales
+    # (1) Compute global relative error for each test sample
     errors = []
     for th, true_s in zip(X_test, y_test):
         pred_s    = model.predict(th[None, :])[0]
@@ -265,16 +298,16 @@ def plot_error_by_param_styled():
         errors.append(err_glob)
     errors = np.array(errors)
 
-    # 2) Indice et valeur de l'erreur max
+    # (2) Locate the worst-case sample
     idx_max = np.argmax(errors)
     max_err = errors[idx_max]
-    print(f"Spectre avec l'erreur maximale : idx = {idx_max}, erreur = {max_err:.2f}%")
+    print(f"Spectrum with maximum error : idx = {idx_max}, erreur = {max_err:.2f}%")
 
-    # 3) Paramètres
+    # (3) Input parameters (as used during training; theta not standardized here)
     kT_vals = X_test[:, 0]
     Z_vals  = X_test[:, 1]
 
-    # 4) Style IEEE
+    # (4) Side-by-side scatter plots with a compact preset
     plt.style.use(['science', 'no-latex', 'scatter'])
     rcParams['figure.dpi']        = 300
     rcParams['font.size']         = 10
@@ -286,16 +319,16 @@ def plot_error_by_param_styled():
     rcParams['lines.linewidth']   = 1.0
     rcParams['grid.linewidth']    = 0.5
 
-    # 5) Création des subplots
+    # (5) Build figure
     fig, (ax1, ax2) = plt.subplots(1, 2, sharey=True)
 
-    # — Erreur vs kT
+    # Error vs kT
     ax1.scatter(kT_vals, errors, color='dodgerblue', edgecolor='k', alpha=0.8 ,s=30, linewidths=0.8)
     ax1.set_xlabel("kT (keV)")
     ax1.set_ylabel("Global error (%)")
 
 
-    # — Erreur vs Abondance
+    # Error vs abundance
     ax2.scatter(Z_vals, errors, color='dodgerblue', edgecolor='k', alpha=0.8 ,s=30, linewidths=0.8)
     ax2.set_xlabel("Abundances")
 
@@ -303,6 +336,6 @@ def plot_error_by_param_styled():
     plt.tight_layout()
     plt.show()
 
-# Exemple d'appel
+# Example call
 plot_error_by_param_styled()
 
