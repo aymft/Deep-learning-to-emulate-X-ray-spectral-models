@@ -14,11 +14,11 @@ import matplotlib.pyplot         as plt
 from matplotlib import rcParams
 import scienceplots
 
-
+# Ensure minus signs are rendered correctly with the chosen backend
 plt.rcParams['axes.unicode_minus'] = False
 
 
-# ── 0) Liste de vos fichiers .npz et containers ───────────────────────────────
+# ── 0) List of .npz files (energy sub-bands) ─────────────────────────────────
 file_paths = [
     "/tmpdir/ferec/apec_log7_0.1-0.3keV.npz",
     "/tmpdir/ferec/apec_log7_0.3-0.5keV.npz",
@@ -52,6 +52,7 @@ file_paths = [
     # "/tmpdir/ferec/apec_49.0-50.0keV.npz",
 ]
 
+# Containers to keep track of each band’s model, scaler, and test split
 models       = []
 X_tests      = []
 y_tests      = []
@@ -60,8 +61,12 @@ energies = []
 labels = [f"Bande {i+1}" for i in range(len(file_paths))]
 
 
-# ── 1) Fonction de construction du modèle ─────────────────────────────────────
+# ── 1) Model builder ─────────────────────────────────────────────────────────
 def build_surrogate_model(input_dim, output_dim, n_units=128):
+    """
+    Small MLP with shared trunk and two heads (continuum + emission).
+    Final output is the sum of both heads.
+    """
     inp = Input(shape=(input_dim,))
     x = Dense(n_units, activation='gelu')(inp)
     x = Dense(n_units, activation='gelu')(x)
@@ -73,8 +78,15 @@ def build_surrogate_model(input_dim, output_dim, n_units=128):
     out = Add()([cont, emis])
     return Model(inp, out)
 
-# ── 2) Votre loss custom ───────────────────────────────────────────────────────
+# ── 2) Custom spectral loss ──────────────────────────────────────────────────
 def improved_spectral_loss(y_true, y_pred):
+    """
+    Composite loss on standardized spectra:
+      - value MSE
+      - first-derivative MSE (slope along energy)
+      - 2× second-derivative MSE (curvature along energy)
+    This promotes local shape fidelity (lines/edges) beyond plain MSE.
+    """
     mse      = tf.reduce_mean(tf.square(y_true - y_pred))
     dy_true  = y_true[:,1:] - y_true[:,:-1]
     dy_pred  = y_pred[:,1:] - y_pred[:,:-1]
@@ -84,7 +96,7 @@ def improved_spectral_loss(y_true, y_pred):
     curv     = tf.reduce_mean(tf.square(ddy_true - ddy_pred))
     return mse + grad + 2.0 * curv
 
-# ── 3) Boucle sur les fichiers pour charger + entraîner ────────────────────────
+# ── 3) Loop over files: load → preprocess → train per-band model ─────────────
 for path, label in zip(file_paths, labels):
     # 3.a) Chargement
     data      = np.load(path)
@@ -139,9 +151,11 @@ import scienceplots
 
 def plot_concat_styled(idx):
     """
-    Affiche en deux subplots (2/3 pour le spectre concaténé, 1/3 pour l'erreur concaténée),
-    avec le style IEEE (science, no-latex), en semilogy pour les spectres,
-    et en abscisse les vraies énergies (keV).
+    Create a 2-row figure:
+      • Top (2/3): concatenated spectrum (log-log) — reconstructed vs original.
+      • Bottom (1/3): concatenated per-bin relative error (%).
+    Uses 'science' + 'no-latex' style and plots against the true energy (keV).
+    Saves 'plot_concat.pdf'.
     """
     # 1) Préparation des données
     eps = 1e-8
